@@ -119,6 +119,43 @@ def test_compile_backends():
     return results
 
 
+# ── Test 5: dynamic shapes ────────────────────────────────────────
+
+def test_dynamic_shapes():
+    """torch.compile(dynamic=True) stresses a different code path:
+    - Guards check shapes at runtime instead of baking them in
+    - Inductor generates shape-agnostic Triton kernels
+    - Multiple shapes trigger recompiles; first call is a graph break test
+    """
+    print("\n====== TEST 5: TORCH.COMPILE DYNAMIC SHAPES ======")
+
+    def fn(q, k, v):
+        return flex_attention(q, k, v)
+
+    compiled_fn = torch.compile(fn, backend="inductor", dynamic=True)
+
+    # Test with two different sequence lengths to trigger dynamic recompile
+    shapes = [
+        (1, 8, 128, 64),   # short
+        (1, 8, 256, 64),   # longer — recompile or reuse dynamic graph
+    ]
+
+    for batch, heads, seq, dim in shapes:
+        q = torch.randn(batch, heads, seq, dim, device=DEVICE, dtype=torch.float16)
+        k = torch.randn(batch, heads, seq, dim, device=DEVICE, dtype=torch.float16)
+        v = torch.randn(batch, heads, seq, dim, device=DEVICE, dtype=torch.float16)
+        try:
+            out = compiled_fn(q, k, v)
+            print(f"  dynamic=(1,{heads},{seq},{dim}): PASS  shape={out.shape}")
+        except Exception as e:
+            print(f"  dynamic=(1,{heads},{seq},{dim}): FAIL  "
+                  f"{type(e).__name__}: {str(e).split(chr(10))[0]}")
+            return False
+
+    print("  → dynamic=True works across shape changes on NPU")
+    return True
+
+
 # ── Main ──────────────────────────────────────────────────────────
 
 def main():
@@ -132,6 +169,7 @@ def main():
 
     eager_ok = test_flex_attention_eager()
     compile_results = test_compile_backends()
+    dynamic_ok = test_dynamic_shapes()
 
     # ── Summary ──
     print("\n========== SUMMARY ==========")
@@ -147,11 +185,15 @@ def main():
     else:
         print(f"  torch.compile:       FAIL — all backends")
 
+    print(f"  dynamic shapes:      {'PASS' if dynamic_ok else 'FAIL'}")
+
     if not eager_ok:
         print("\n  → FlexAttention kernel missing for NPU (PrivateUse1).")
         print("    Need: NPU kernel or fallback to SDPA / torch_npu.npu_fusion_attention.")
+    elif inductor_ok and dynamic_ok:
+        print("\n  → Full FlexAttention + Inductor (static + dynamic) works on NPU.")
     elif inductor_ok:
-        print("\n  → Full FlexAttention + Inductor Triton compilation works on NPU.")
+        print("\n  → Static compile works. Dynamic shapes fail — check guards/recompiles.")
     elif working:
         print("\n  → Eager kernel works. Inductor Triton codegen fails.")
         print("    Check the inductor debug trace for the root cause.")
