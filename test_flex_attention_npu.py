@@ -27,17 +27,15 @@ def test_patch():
     assert getattr(fa_mod, "_npu_patch_applied", False), "Patch not installed"
     print("  Patch installed: OK")
 
-    if hasattr(fa_mod, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG"):
-        flag = fa_mod._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG
-        print(f"  _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = {flag}")
-        assert flag is True, "Compile flag not set"
-    else:
-        print("  _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG: not present (older PyTorch)")
-
-    # Verify the validate function is our patched version, not the original
-    # (original_validate_device doesn't exist — the patch uses original_validate)
     assert callable(fa_mod._validate_device), "Validate not callable"
     print("  _validate_device replaced: OK")
+
+    # Check if compile-debug flag exists (added in PyTorch 2.8+)
+    if hasattr(fa_mod, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG"):
+        print(f"  _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = "
+              f"{fa_mod._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG}")
+    else:
+        print("  _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG: n/a (PyTorch < 2.8)")
 
 
 # ── Test 2: device validation bypass ──────────────────────────────
@@ -54,10 +52,10 @@ def test_device_validation():
         raise
 
 
-# ── Test 3: eager execution (compile disabled) ────────────────────
+# ── Test 3: eager execution (no compile) ──────────────────────────
 
 def test_flex_attention_eager():
-    print("\n====== TEST 3: FLEX ATTENTION EAGER (compile disabled) ======")
+    print("\n====== TEST 3: FLEX ATTENTION EAGER ======")
     q, k, v = make_qkv()
 
     try:
@@ -72,73 +70,45 @@ def test_flex_attention_eager():
         return False
 
 
-# ── Test 4: torch.compile scenario ────────────────────────────────
+# ── Test 4: torch.compile across backends ─────────────────────────
 
-def test_flex_attention_compile():
-    print("\n====== TEST 4: TORCH.COMPILE (compile disabled) ======")
-    q, k, v = make_qkv()
+def test_compile_backends():
+    """Try each compile backend to find which (if any) works on NPU."""
+    print("\n====== TEST 4: TORCH.COMPILE BACKENDS ======")
 
-    def fn(q, k, v):
-        return flex_attention(q, k, v)
-
-    try:
-        compiled_fn = torch.compile(fn, backend="inductor")
-        out = compiled_fn(q, k, v)
-        print(f"  Compile output shape: {out.shape}")
-        print("  torch.compile: PASSED")
-        return True
-    except Exception as e:
-        print(f"  torch.compile: FAILED")
-        print(f"  {type(e).__name__}: {e}")
-        return False
-
-
-# ── Test 5: compile enabled vs disabled comparison ────────────────
-
-def test_compile_comparison():
-    """Toggle _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG to isolate the blocker."""
-    print("\n====== TEST 5: COMPILE ENABLED vs DISABLED ======")
-
-    if not hasattr(fa_mod, "_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG"):
-        print("  SKIP: _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG not present")
-        return
+    # Backends ordered by likelihood on NPU:
+    #   "inductor"     — needs Triton, expected fail on 2.7.1+cpu
+    #   "aot_eager"    — no codegen, just captures graph; good fallback
+    #   "eager"        — same idea, simpler
+    #   "openxla"      — if torch_xla is installed
+    backends = ["inductor", "aot_eager", "eager"]
 
     q, k, v = make_qkv()
 
     def fn(q, k, v):
         return flex_attention(q, k, v)
 
-    # ── With compile disabled (current patch state) ──
-    fa_mod._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
-    result_disabled = "PASS"
-    try:
-        torch.compile(fn, backend="inductor")(q, k, v)
-    except Exception as e:
-        result_disabled = f"FAIL — {type(e).__name__}: {e}"
+    results = {}
+    for backend in backends:
+        try:
+            torch.compile(fn, backend=backend)(q, k, v)
+            results[backend] = "PASS"
+        except Exception as e:
+            # Extract the key error: just the type + first line
+            msg = str(e).split("\n")[0]
+            results[backend] = f"FAIL — {type(e).__name__}: {msg}"
 
-    # ── With compile enabled (original behavior) ──
-    fa_mod._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = False
-    result_enabled = "PASS"
-    try:
-        torch.compile(fn, backend="inductor")(q, k, v)
-    except Exception as e:
-        result_enabled = f"FAIL — {type(e).__name__}: {e}"
+    for backend, result in results.items():
+        print(f"  {backend:12s}: {result}")
 
-    # ── Restore patch state ──
-    fa_mod._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
-
-    print(f"  Compile DISABLED: {result_disabled}")
-    print(f"  Compile ENABLED:  {result_enabled}")
-
-    # Interpret
-    if "PASS" in result_disabled and "PASS" not in result_enabled:
-        print("  → Compile path IS the blocker on NPU")
-    elif "PASS" in result_disabled and "PASS" in result_enabled:
-        print("  → Both work; compile path is fine on NPU")
-    elif "PASS" not in result_disabled and "PASS" not in result_enabled:
-        print("  → Both fail; blocker is deeper than compile (kernel missing)")
+    # Identify the first working backend
+    working = [b for b, r in results.items() if "PASS" in r]
+    if working:
+        print(f"  → Use: torch.compile(fn, backend=\"{working[0]}\")")
     else:
-        print("  → Unexpected: compile enabled works but disabled doesn't")
+        print("  → No compile backend works. Use eager mode (-no-compile).")
+
+    return results
 
 
 # ── Main ──────────────────────────────────────────────────────────
@@ -149,29 +119,32 @@ def main():
     if not torch.npu.is_available():
         raise RuntimeError("NPU not available — this test requires an Ascend NPU device")
 
-    results = {}
-
     test_patch()
     test_device_validation()
 
-    results["eager"] = test_flex_attention_eager()
-    results["compile"] = test_flex_attention_compile()
-
-    test_compile_comparison()
+    eager_ok = test_flex_attention_eager()
+    compile_results = test_compile_backends()
 
     # ── Summary ──
     print("\n========== SUMMARY ==========")
-    print(f"  Eager (no compile):  {'PASS' if results.get('eager') else 'FAIL'}")
-    print(f"  torch.compile:       {'PASS' if results.get('compile') else 'FAIL'}")
+    print(f"  Eager (no compile):  {'PASS' if eager_ok else 'FAIL'}")
 
-    if not results.get("eager"):
-        print("\n  → FlexAttention kernel missing for NPU (PrivateUse1).")
-        print("    Need: NPU kernel implementation or fallback to SDPA / torch_npu.npu_fusion_attention.")
-    elif not results.get("compile"):
-        print("\n  → Kernel exists but compile path broken on NPU.")
-        print("    Keep _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True as workaround.")
+    working = [b for b, r in compile_results.items() if "PASS" in r]
+    if working:
+        print(f"  torch.compile:       PASS (backend={working[0]})")
+    elif "inductor" in compile_results and "Triton" in str(compile_results.get("inductor", "")):
+        print(f"  torch.compile:       FAIL — no Triton on NPU; try aot_eager or eager backend")
     else:
-        print("\n  → Full FlexAttention + compile works on NPU.")
+        print(f"  torch.compile:       FAIL — all backends")
+
+    if not eager_ok:
+        print("\n  → FlexAttention kernel missing for NPU (PrivateUse1).")
+        print("    Need: NPU kernel or fallback to SDPA / torch_npu.npu_fusion_attention.")
+    elif not working:
+        print("\n  → Kernel exists (eager works) but no compile backend supports NPU.")
+        print("    Use eager mode or torch.compile(..., backend=\"aot_eager\") as fallback.")
+    else:
+        print(f"\n  → Full FlexAttention + compile works on NPU (backend={working[0]}).")
 
     print("============================\n")
 
