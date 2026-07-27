@@ -77,10 +77,9 @@ def test_compile_backends():
     print("\n====== TEST 4: TORCH.COMPILE BACKENDS ======")
 
     # Backends ordered by likelihood on NPU:
-    #   "inductor"     — needs Triton, expected fail on 2.7.1+cpu
-    #   "aot_eager"    — no codegen, just captures graph; good fallback
-    #   "eager"        — same idea, simpler
-    #   "openxla"      — if torch_xla is installed
+    #   "inductor"     — full Triton codegen; needs triton-ascend working
+    #   "aot_eager"    — AOTAutograd graph capture, no Triton codegen
+    #   "eager"        — fx graph capture only, no codegen at all
     backends = ["inductor", "aot_eager", "eager"]
 
     q, k, v = make_qkv()
@@ -94,19 +93,28 @@ def test_compile_backends():
             torch.compile(fn, backend=backend)(q, k, v)
             results[backend] = "PASS"
         except Exception as e:
-            # Extract the key error: just the type + first line
-            msg = str(e).split("\n")[0]
-            results[backend] = f"FAIL — {type(e).__name__}: {msg}"
+            # Print full error for inductor (the one that matters)
+            msg = str(e)
+            if backend == "inductor":
+                # Show the last meaningful line: the root cause
+                lines = [l for l in msg.split("\n") if l.strip()]
+                results[backend] = f"FAIL — {lines[-1].strip() if lines else type(e).__name__}"
+            else:
+                results[backend] = f"FAIL — {type(e).__name__}: {msg.split(chr(10))[0]}"
 
     for backend, result in results.items():
         print(f"  {backend:12s}: {result}")
 
-    # Identify the first working backend
     working = [b for b, r in results.items() if "PASS" in r]
-    if working:
-        print(f"  → Use: torch.compile(fn, backend=\"{working[0]}\")")
+    inductor_ok = "PASS" in results.get("inductor", "")
+
+    if inductor_ok:
+        print("  → Inductor works: full Triton codegen on NPU")
+    elif working:
+        print(f"  → Inductor FAILED. Fallback: torch.compile(fn, backend=\"{working[0]}\")")
+        print("    (aot_eager/eager = graph capture only, no Triton kernel generation)")
     else:
-        print("  → No compile backend works. Use eager mode (-no-compile).")
+        print("  → No compile backend works. Use eager mode.")
 
     return results
 
@@ -129,22 +137,26 @@ def main():
     print("\n========== SUMMARY ==========")
     print(f"  Eager (no compile):  {'PASS' if eager_ok else 'FAIL'}")
 
+    inductor_ok = "PASS" in compile_results.get("inductor", "")
     working = [b for b, r in compile_results.items() if "PASS" in r]
-    if working:
-        print(f"  torch.compile:       PASS (backend={working[0]})")
-    elif "inductor" in compile_results and "Triton" in str(compile_results.get("inductor", "")):
-        print(f"  torch.compile:       FAIL — no Triton on NPU; try aot_eager or eager backend")
+
+    if inductor_ok:
+        print(f"  torch.compile:       PASS — Inductor Triton codegen on NPU")
+    elif working:
+        print(f"  torch.compile:       FALLBACK — inductor failed, {working[0]} works (graph capture only)")
     else:
         print(f"  torch.compile:       FAIL — all backends")
 
     if not eager_ok:
         print("\n  → FlexAttention kernel missing for NPU (PrivateUse1).")
         print("    Need: NPU kernel or fallback to SDPA / torch_npu.npu_fusion_attention.")
-    elif not working:
-        print("\n  → Kernel exists (eager works) but no compile backend supports NPU.")
-        print("    Use eager mode or torch.compile(..., backend=\"aot_eager\") as fallback.")
+    elif inductor_ok:
+        print("\n  → Full FlexAttention + Inductor Triton compilation works on NPU.")
+    elif working:
+        print("\n  → Eager kernel works. Inductor Triton codegen fails.")
+        print("    Check the inductor debug trace for the root cause.")
     else:
-        print(f"\n  → Full FlexAttention + compile works on NPU (backend={working[0]}).")
+        print("\n  → Kernel exists (eager works) but no compile backend works on NPU.")
 
     print("============================\n")
 
