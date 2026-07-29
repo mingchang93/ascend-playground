@@ -3,7 +3,7 @@
 import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu  # module-level monkey-patch on import
-
+import npu_compat
 
 class Model(torch.nn.Module):
     def __init__(self):
