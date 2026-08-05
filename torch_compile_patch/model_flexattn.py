@@ -2,7 +2,6 @@
 # It does NOT patch torch.compile — flex_attn_patch covers that gap.
 import torch
 import torch_npu
-from torch_npu.contrib import transfer_to_npu  # module-level monkey-patch on import
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import flex_attn_patch.patch_flex_attention_npu  # monkey-patch flex_attention for NPU
 
