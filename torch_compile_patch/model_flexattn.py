@@ -5,6 +5,7 @@ import torch_npu
 from torch_npu.contrib import transfer_to_npu  # module-level monkey-patch on import
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import npu_compat
+import flex_attn_patch.patch_flex_attention_npu  # monkey-patch flex_attention for NPU
 
 device = "npu"
 torch.set_default_device(device)
