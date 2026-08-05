@@ -24,7 +24,7 @@ class Model(torch.nn.Module):
             causal_mask, B=B, H=H, Q_LEN=Q_LEN, KV_LEN=KV_LEN,
             BLOCK_SIZE=BLOCK_SIZE, device="npu",
         )
-        self.register_buffer("block_mask", block_mask)
+        self.block_mask = block_mask
 
     def forward(self, query, key, value):
         return flex_attention(query, key, value, block_mask=self.block_mask)
